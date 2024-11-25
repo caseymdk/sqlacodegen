@@ -823,6 +823,10 @@ class DeclarativeGenerator(TablesGenerator):
             name for namespace in self.imports.values() for name in namespace
         }
         for model in models_by_table_name.values():
+            if isinstance(model, ModelClass):
+                model.relationships = sorted(
+                    model.relationships, key=lambda r: r.constraint.name
+                )
             self.generate_model_name(model, global_names)
             global_names.add(model.name)
 
