@@ -26,7 +26,6 @@ from sqlalchemy import (
     Constraint,
     DefaultClause,
     Enum,
-    Float,
     ForeignKey,
     ForeignKeyConstraint,
     Identity,
@@ -36,12 +35,15 @@ from sqlalchemy import (
     String,
     Table,
     Text,
+    TypeDecorator,
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import CompileError
 from sqlalchemy.sql.elements import TextClause
+from sqlalchemy.sql.type_api import UserDefinedType
+from sqlalchemy.types import TypeEngine
 
 from .models import (
     ColumnAttribute,
@@ -61,11 +63,6 @@ from .utils import (
     render_callable,
     uses_default_name,
 )
-
-if sys.version_info < (3, 10):
-    pass
-else:
-    pass
 
 _re_boolean_check_constraint = re.compile(r"(?:.*?\.)?(.*?) IN \(0, 1\)")
 _re_column_name = re.compile(r'(?:(["`]?).*\1\.)?(["`]?)(.*)\2')
@@ -106,6 +103,11 @@ class CodeGenerator(metaclass=ABCMeta):
         if invalid_options:
             raise ValueError("Unrecognized options: " + ", ".join(invalid_options))
 
+    @property
+    @abstractmethod
+    def views_supported(self) -> bool:
+        pass
+
     @abstractmethod
     def generate(self) -> str:
         """
@@ -133,6 +135,10 @@ class TablesGenerator(CodeGenerator):
         self.indentation: str = indentation
         self.imports: dict[str, set[str]] = defaultdict(set)
         self.module_imports: set[str] = set()
+
+    @property
+    def views_supported(self) -> bool:
+        return True
 
     def generate_base(self) -> None:
         self.base = Base(
@@ -482,6 +488,9 @@ class TablesGenerator(CodeGenerator):
         if comment:
             kwargs["comment"] = repr(comment)
 
+        return self.render_column_callable(is_table, *args, **kwargs)
+
+    def render_column_callable(self, is_table: bool, *args: Any, **kwargs: Any) -> str:
         if is_table:
             self.add_import(Column)
             return render_callable("Column", *args, kwargs=kwargs)
@@ -500,6 +509,7 @@ class TablesGenerator(CodeGenerator):
             if param.name.startswith("_"):
                 continue
             elif param.kind in (Parameter.VAR_POSITIONAL, Parameter.VAR_KEYWORD):
+                use_kwargs = True
                 continue
 
             value = getattr(coltype, param.name, missing)
@@ -523,8 +533,11 @@ class TablesGenerator(CodeGenerator):
             varargs_repr = [repr(arg) for arg in getattr(coltype, vararg)]
             args.extend(varargs_repr)
 
-        if isinstance(coltype, Enum) and coltype.name is not None:
-            kwargs["name"] = repr(coltype.name)
+        # These arguments cannot be autodetected from the Enum initializer
+        if isinstance(coltype, Enum):
+            for colname in "name", "schema":
+                if (value := getattr(coltype, colname)) is not None:
+                    kwargs[colname] = repr(value)
 
         if isinstance(coltype, JSONB):
             # Remove astext_type if it's the default
@@ -666,11 +679,17 @@ class TablesGenerator(CodeGenerator):
             if not supercls.__name__.startswith("_") and hasattr(
                 supercls, "__visit_name__"
             ):
+                # Don't try to adapt UserDefinedType as it's not a proper column type
+                if supercls is UserDefinedType or issubclass(supercls, TypeDecorator):
+                    return coltype
+
                 # Hack to fix adaptation of the Enum class which is broken since
                 # SQLAlchemy 1.2
                 kw = {}
                 if supercls is Enum:
                     kw["name"] = coltype.name
+                    if coltype.schema:
+                        kw["schema"] = coltype.schema
 
                 try:
                     new_coltype = coltype.adapt(supercls)
@@ -688,14 +707,7 @@ class TablesGenerator(CodeGenerator):
                     # If the adapted column type does not render the same as the
                     # original, don't substitute it
                     if new_coltype.compile(self.bind.engine.dialect) != compiled_type:
-                        # Make an exception to the rule for Float and arrays of Float,
-                        # since at least on PostgreSQL, Float can accurately represent
-                        # both REAL and DOUBLE_PRECISION
-                        if not isinstance(new_coltype, Float) and not (
-                            isinstance(new_coltype, ARRAY)
-                            and isinstance(new_coltype.item_type, Float)
-                        ):
-                            break
+                        break
                 except CompileError:
                     # If the adapted column type can't be compiled, don't substitute it
                     break
@@ -1189,22 +1201,40 @@ class DeclarativeGenerator(TablesGenerator):
         column = column_attr.column
         rendered_column = self.render_column(column, column_attr.name != column.name)
 
-        try:
-            python_type = column.type.python_type
-            python_type_name = python_type.__name__
-            if python_type.__module__ == "builtins":
-                column_python_type = python_type_name
-            else:
-                python_type_module = python_type.__module__
-                column_python_type = f"{python_type_module}.{python_type_name}"
-                self.add_module_import(python_type_module)
-        except NotImplementedError:
-            self.add_literal_import("typing", "Any")
-            column_python_type = "Any"
+        def get_type_qualifiers() -> tuple[str, TypeEngine[Any], str]:
+            column_type = column.type
+            pre: list[str] = []
+            post_size = 0
+            if column.nullable:
+                self.add_literal_import("typing", "Optional")
+                pre.append("Optional[")
+                post_size += 1
 
-        if column.nullable:
-            self.add_literal_import("typing", "Optional")
-            column_python_type = f"Optional[{column_python_type}]"
+            if isinstance(column_type, ARRAY):
+                dim = getattr(column_type, "dimensions", None) or 1
+                pre.extend("list[" for _ in range(dim))
+                post_size += dim
+
+                column_type = column_type.item_type
+
+            return "".join(pre), column_type, "]" * post_size
+
+        def render_python_type(column_type: TypeEngine[Any]) -> str:
+            python_type = column_type.python_type
+            python_type_name = python_type.__name__
+            python_type_module = python_type.__module__
+            if python_type_module == "builtins":
+                return python_type_name
+
+            try:
+                self.add_module_import(python_type_module)
+                return f"{python_type_module}.{python_type_name}"
+            except NotImplementedError:
+                self.add_literal_import("typing", "Any")
+                return "Any"
+
+        pre, col_type, post = get_type_qualifiers()
+        column_python_type = f"{pre}{render_python_type(col_type)}{post}"
         return f"{column_attr.name}: Mapped[{column_python_type}] = {rendered_column}"
 
     def render_relationship(self, relationship: RelationshipAttribute) -> str:
@@ -1285,16 +1315,19 @@ class DeclarativeGenerator(TablesGenerator):
 
         relationship_type: str
         if relationship.type == RelationshipType.ONE_TO_MANY:
-            self.add_literal_import("typing", "List")
-            relationship_type = f"List['{relationship.target.name}']"
+            relationship_type = f"list['{relationship.target.name}']"
         elif relationship.type in (
             RelationshipType.ONE_TO_ONE,
             RelationshipType.MANY_TO_ONE,
         ):
             relationship_type = f"'{relationship.target.name}'"
+            if relationship.constraint and any(
+                col.nullable for col in relationship.constraint.columns
+            ):
+                self.add_literal_import("typing", "Optional")
+                relationship_type = f"Optional[{relationship_type}]"
         elif relationship.type == RelationshipType.MANY_TO_MANY:
-            self.add_literal_import("typing", "List")
-            relationship_type = f"List['{relationship.target.name}']"
+            relationship_type = f"list['{relationship.target.name}']"
         else:
             self.add_literal_import("typing", "Any")
             relationship_type = "Any"
@@ -1334,10 +1367,7 @@ class DataclassGenerator(DeclarativeGenerator):
                 LiteralImport("sqlalchemy.orm", "MappedAsDataclass"),
             ],
             declarations=[
-                (
-                    f"class {self.base_class_name}(MappedAsDataclass, "
-                    "DeclarativeBase):"
-                ),
+                (f"class {self.base_class_name}(MappedAsDataclass, DeclarativeBase):"),
                 f"{self.indentation}pass",
             ],
             metadata_ref=f"{self.base_class_name}.metadata",
@@ -1361,6 +1391,14 @@ class SQLModelGenerator(DeclarativeGenerator):
             indentation=indentation,
             base_class_name=base_class_name,
         )
+
+    @property
+    def views_supported(self) -> bool:
+        return False
+
+    def render_column_callable(self, is_table: bool, *args: Any, **kwargs: Any) -> str:
+        self.add_import(Column)
+        return render_callable("Column", *args, kwargs=kwargs)
 
     def generate_base(self) -> None:
         self.base = Base(
@@ -1386,13 +1424,6 @@ class SQLModelGenerator(DeclarativeGenerator):
 
             if model.relationships:
                 self.add_literal_import("sqlmodel", "Relationship")
-
-            for relationship_attr in model.relationships:
-                if relationship_attr.type in (
-                    RelationshipType.ONE_TO_MANY,
-                    RelationshipType.MANY_TO_MANY,
-                ):
-                    self.add_literal_import("typing", "List")
 
     def collect_imports_for_column(self, column: Column[Any]) -> None:
         super().collect_imports_for_column(column)
@@ -1465,8 +1496,7 @@ class SQLModelGenerator(DeclarativeGenerator):
             RelationshipType.ONE_TO_MANY,
             RelationshipType.MANY_TO_MANY,
         ):
-            self.add_literal_import("typing", "List")
-            annotation = f"List[{annotation}]"
+            annotation = f"list[{annotation}]"
         else:
             self.add_literal_import("typing", "Optional")
             annotation = f"Optional[{annotation}]"
