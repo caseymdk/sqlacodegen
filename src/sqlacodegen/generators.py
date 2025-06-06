@@ -776,7 +776,9 @@ class DeclarativeGenerator(TablesGenerator):
         # Pick association tables from the metadata into their own set, don't process
         # them normally
         links: defaultdict[str, list[Model]] = defaultdict(lambda: [])
-        for table in self.metadata.sorted_tables:
+        # Use sorted_tables to respect foreign key dependencies
+        sorted_tables = list(self.metadata.sorted_tables)
+        for table in sorted_tables:
             qualified_name = qualified_table_name(table)
 
             # Link tables have exactly two foreign key constraints and all columns are
@@ -805,17 +807,21 @@ class DeclarativeGenerator(TablesGenerator):
                     column_attr = ColumnAttribute(model, column)
                     model.columns.append(column_attr)
 
-        # Add relationships
-        for model in sorted(models_by_table_name.values(), key=lambda m: m.table.name):
-            if isinstance(model, ModelClass):
+        # Add relationships - preserve dependency order from sorted_tables
+        for table in sorted_tables:
+            qualified_name = qualified_table_name(table)
+            model = models_by_table_name.get(qualified_name)
+            if model and isinstance(model, ModelClass):
                 self.generate_relationships(
                     model, models_by_table_name, links[model.table.name]
                 )
 
         # Nest inherited classes in their superclasses to ensure proper ordering
         if "nojoined" not in self.options:
-            for model in sorted(models_by_table_name.values(), key=lambda m: m.table.name):
-                if not isinstance(model, ModelClass):
+            for table in sorted_tables:
+                qualified_name = qualified_table_name(table)
+                model = models_by_table_name.get(qualified_name)
+                if not model or not isinstance(model, ModelClass):
                     continue
 
                 pk_column_names = {col.name for col in model.table.primary_key.columns}
@@ -842,7 +848,12 @@ class DeclarativeGenerator(TablesGenerator):
         global_names = {
             name for namespace in self.imports.values() for name in namespace
         }
-        for model in sorted(models_by_table_name.values(), key=lambda m: m.table.name):
+        # Process models in dependency order from sorted_tables
+        for table in sorted_tables:
+            qualified_name = qualified_table_name(table)
+            model = models_by_table_name.get(qualified_name)
+            if not model:
+                continue
             if isinstance(model, ModelClass):
                 model.relationships = sorted(
                     model.relationships, key=lambda r: r.constraint.name
@@ -850,7 +861,14 @@ class DeclarativeGenerator(TablesGenerator):
             self.generate_model_name(model, global_names)
             global_names.add(model.name)
 
-        return sorted(models_by_table_name.values(), key=lambda m: m.table.name)
+        # Return models in the same dependency-respecting order
+        result = []
+        for table in sorted_tables:
+            qualified_name = qualified_table_name(table)
+            model = models_by_table_name.get(qualified_name)
+            if model:
+                result.append(model)
+        return result
 
     def generate_relationships(
         self,
