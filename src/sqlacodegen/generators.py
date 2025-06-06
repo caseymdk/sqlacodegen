@@ -1228,15 +1228,19 @@ class DeclarativeGenerator(TablesGenerator):
             return "".join(pre), column_type, "]" * post_size
 
         def render_python_type(column_type: TypeEngine[Any]) -> str:
-            python_type = column_type.python_type
-            python_type_name = python_type.__name__
-            python_type_module = python_type.__module__
-            if python_type_module == "builtins":
-                return python_type_name
-
             try:
-                self.add_module_import(python_type_module)
-                return f"{python_type_module}.{python_type_name}"
+                python_type = column_type.python_type
+                python_type_name = python_type.__name__
+                python_type_module = python_type.__module__
+                if python_type_module == "builtins":
+                    return python_type_name
+
+                try:
+                    self.add_module_import(python_type_module)
+                    return f"{python_type_module}.{python_type_name}"
+                except NotImplementedError:
+                    self.add_literal_import("typing", "Any")
+                    return "Any"
             except NotImplementedError:
                 self.add_literal_import("typing", "Any")
                 return "Any"
