@@ -801,12 +801,12 @@ class DeclarativeGenerator(TablesGenerator):
                 models_by_table_name[qualified_name] = model
 
                 # Fill in the columns
-                for column in table.c:
+                for column in sorted(table.c, key=lambda col: col.name):
                     column_attr = ColumnAttribute(model, column)
                     model.columns.append(column_attr)
 
         # Add relationships
-        for model in models_by_table_name.values():
+        for model in sorted(models_by_table_name.values(), key=lambda m: m.table.name):
             if isinstance(model, ModelClass):
                 self.generate_relationships(
                     model, models_by_table_name, links[model.table.name]
@@ -814,7 +814,7 @@ class DeclarativeGenerator(TablesGenerator):
 
         # Nest inherited classes in their superclasses to ensure proper ordering
         if "nojoined" not in self.options:
-            for model in list(models_by_table_name.values()):
+            for model in sorted(models_by_table_name.values(), key=lambda m: m.table.name):
                 if not isinstance(model, ModelClass):
                     continue
 
@@ -842,7 +842,7 @@ class DeclarativeGenerator(TablesGenerator):
         global_names = {
             name for namespace in self.imports.values() for name in namespace
         }
-        for model in models_by_table_name.values():
+        for model in sorted(models_by_table_name.values(), key=lambda m: m.table.name):
             if isinstance(model, ModelClass):
                 model.relationships = sorted(
                     model.relationships, key=lambda r: r.constraint.name
@@ -850,7 +850,7 @@ class DeclarativeGenerator(TablesGenerator):
             self.generate_model_name(model, global_names)
             global_names.add(model.name)
 
-        return list(models_by_table_name.values())
+        return sorted(models_by_table_name.values(), key=lambda m: m.table.name)
 
     def generate_relationships(
         self,
